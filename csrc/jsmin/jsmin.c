@@ -1,7 +1,9 @@
+// go@ mgit build jsmin
 /* jsmin.c
    2019-10-30
 
 Copyright (C) 2002 Douglas Crockford  (www.crockford.com)
+Lua adaptation by Cosmin Apreutesei. Public Domain.
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of
 this software and associated documentation files (the "Software"), to deal in
@@ -22,298 +24,275 @@ AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
 LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
 OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
+
 */
 
 #include <stdlib.h>
 #include <stdio.h>
+#include "lua.h"
+#include "lauxlib.h"
 
-static int the_a;
-static int the_b;
-static int look_ahead = EOF;
-static int the_x = EOF;
-static int the_y = EOF;
+typedef struct st {
+	const char* s; // input string
+	int n; // input string length
+	int i; // current index in input string
+	luaL_Buffer out;
+	int a;
+	int b;
+	int x;
+	int y;
+} st;
 
+#define error(s) luaL_error(L, s)
 
-static void error(char* string) {
-    fputs("JSMIN Error: ", stderr);
-    fputs(string, stderr);
-    fputc('\n', stderr);
-    exit(1);
+// return true if the character is a letter, digit, underscore, dollar sign,
+// or non-ASCII character.
+static int is_alphanum(int c) {
+	return (
+		   (c >= 'a' && c <= 'z')
+		|| (c >= '0' && c <= '9')
+		|| (c >= 'A' && c <= 'Z')
+		|| c == '_'
+		|| c == '$'
+		|| c == '\\'
+		|| c > 126
+	);
 }
 
-/* is_alphanum -- return true if the character is a letter, digit, underscore,
-        dollar sign, or non-ASCII character.
-*/
+// return the next character from the string. Watch out for lookahead.
+// If the character is a control character, translate it to a space or linefeed.
+static int _get(lua_State *L, st* s) {
+	int c = s->i < s->n ? s->s[s->i++] : EOF;
+	if (c >= ' ' || c == '\n' || c == EOF)
+		return c;
+	if (c == '\r')
+		return '\n';
+	return ' ';
+}
+#define get() _get(L, s)
 
-static int is_alphanum(int codeunit) {
-    return (
-        (codeunit >= 'a' && codeunit <= 'z')
-        || (codeunit >= '0' && codeunit <= '9')
-        || (codeunit >= 'A' && codeunit <= 'Z')
-        || codeunit == '_'
-        || codeunit == '$'
-        || codeunit == '\\'
-        || codeunit > 126
-    );
+// get the next character without advancing.
+static int _peek(lua_State *L, st* s) {
+	return s->i < s->n ? s->s[s->i] : EOF;
+}
+#define peek() _peek(L, s)
+
+// get the next character, excluding comments. peek() is used to see
+// if a '/' is followed by a '/' or '*'.
+static int _next(lua_State *L, st* s) {
+	int c = get();
+	if  (c == '/') {
+		switch (peek()) {
+		case '/':
+			for (;;) {
+				c = get();
+				if (c <= '\n') {
+					break;
+				}
+			}
+			break;
+		case '*':
+			get();
+			while (c != ' ') {
+				switch (get()) {
+				case '*':
+					if (peek() == '/') {
+						get();
+						c = ' ';
+					}
+					break;
+				case EOF:
+					error("unterminated comment");
+				}
+			}
+			break;
+		}
+	}
+	s->y = s->x;
+	s->x = c;
+	return c;
+}
+#define next() _next(L, s)
+
+#define putc(c, stdout) luaL_addchar(&s->out, c)
+
+/* the argument can be one of:
+		1:   Output A. Copy B to A. Get the next B.
+		2:   Copy B to A. Get the next B. (Delete A).
+		3:   Get the next B. (Delete B).
+   Treats a string as a single character.
+   Recognizes a regular expression if it is preceded by the likes of '(' or ',' or '='.
+*/
+static void _action(lua_State *L, st* s, int determined) {
+	switch (determined) {
+	case 1:
+		putc(s->a, stdout);
+		if (
+			   (s->y == '\n' || s->y == ' ')
+			&& (s->a == '+'  || s->a == '-' || s->a == '*' || s->a == '/')
+			&& (s->b == '+'  || s->b == '-' || s->b == '*' || s->b == '/')
+		) {
+			putc(s->y, stdout);
+		}
+	case 2:
+		s->a = s->b;
+		if (s->a == '\'' || s->a == '"' || s->a == '`') {
+			for (;;) {
+				putc(s->a, stdout);
+				s->a = get();
+				if (s->a == s->b) {
+					break;
+				}
+				if (s->a == '\\') {
+					putc(s->a, stdout);
+					s->a = get();
+				}
+				if (s->a == EOF) {
+					error("unterminated string literal");
+				}
+			}
+		}
+	case 3:
+		s->b = next();
+		if (s->b == '/' && (
+			   s->a == '(' || s->a == ',' || s->a == '=' || s->a == ':'
+			|| s->a == '[' || s->a == '!' || s->a == '&' || s->a == '|'
+			|| s->a == '?' || s->a == '+' || s->a == '-' || s->a == '~'
+			|| s->a == '*' || s->a == '/' || s->a == '{' || s->a == '}'
+			|| s->a == ';'
+		)) {
+			putc(s->a, stdout);
+			if (s->a == '/' || s->a == '*') {
+				putc(' ', stdout);
+			}
+			putc(s->b, stdout);
+			for (;;) {
+				s->a = get();
+				if (s->a == '[') {
+					for (;;) {
+						putc(s->a, stdout);
+						s->a = get();
+						if (s->a == ']') {
+							break;
+						}
+						if (s->a == '\\') {
+							putc(s->a, stdout);
+							s->a = get();
+						}
+						if (s->a == EOF) {
+							error("unterminated set in regexp literal");
+						}
+					}
+				} else if (s->a == '/') {
+					switch (peek()) {
+					case '/':
+					case '*':
+						error("unterminated set in regexp literal");
+					}
+					break;
+				} else if (s->a =='\\') {
+					putc(s->a, stdout);
+					s->a = get();
+				}
+				if (s->a == EOF) {
+					error("unterminated regexp literal");
+				}
+				putc(s->a, stdout);
+			}
+			s->b = next();
+		}
+	}
+}
+#define action(d) _action(L, s, d)
+
+// copy the input to the output, deleting the characters which are
+// insignificant to JavaScript. Comments will be removed. Tabs will be
+// replaced with spaces. CR will be replaced with LF.
+// Most spaces and LFs will be removed.
+static int jsmin(lua_State *L) {
+
+	st _s = {
+		.x = EOF,
+		.y = EOF,
+	};
+
+	size_t sn;
+	_s.s = luaL_checklstring(L, 1, &sn);
+	_s.n = sn;
+
+	st *s = &_s;
+
+	luaL_buffinit(L, &s->out);
+
+	if (peek() == 0xEF) {
+		get();
+		get();
+		get();
+	}
+	s->a = '\n';
+	action(3);
+	while (s->a != EOF) {
+		switch (s->a) {
+		case ' ':
+			action(is_alphanum(s->b) ? 1 : 2);
+			break;
+		case '\n':
+			switch (s->b) {
+			case '{':
+			case '[':
+			case '(':
+			case '+':
+			case '-':
+			case '!':
+			case '~':
+				action(1);
+				break;
+			case ' ':
+				action(3);
+				break;
+			default:
+				action(is_alphanum(s->b) ? 1 : 2);
+			}
+			break;
+		default:
+			switch (s->b) {
+			case ' ':
+				action(is_alphanum(s->a) ? 1 : 3);
+				break;
+			case '\n':
+				switch (s->a) {
+				case '}':
+				case ']':
+				case ')':
+				case '+':
+				case '-':
+				case '"':
+				case '\'':
+				case '`':
+					action(1);
+					break;
+				default:
+					action(is_alphanum(s->a) ? 1 : 3);
+				}
+				break;
+			default:
+				action(1);
+				break;
+			}
+		}
+	}
+
+	luaL_pushresult(&s->out);
+	return 1;
 }
 
-
-/* get -- return the next character from stdin. Watch out for lookahead. If
-        the character is a control character, translate it to a space or
-        linefeed.
-*/
-
-static int get() {
-    int codeunit = look_ahead;
-    look_ahead = EOF;
-    if (codeunit == EOF) {
-        codeunit = getc(stdin);
-    }
-    if (codeunit >= ' ' || codeunit == '\n' || codeunit == EOF) {
-        return codeunit;
-    }
-    if (codeunit == '\r') {
-        return '\n';
-    }
-    return ' ';
-}
+static const struct luaL_Reg thislib[] = {
+  {"minify", jsmin},
+  {NULL, NULL}
+};
 
 
-/* peek -- get the next character without advancing.
-*/
-
-static int peek() {
-    look_ahead = get();
-    return look_ahead;
-}
-
-
-/* next -- get the next character, excluding comments. peek() is used to see
-        if a '/' is followed by a '/' or '*'.
-*/
-
-static int next() {
-    int codeunit = get();
-    if  (codeunit == '/') {
-        switch (peek()) {
-        case '/':
-            for (;;) {
-                codeunit = get();
-                if (codeunit <= '\n') {
-                    break;
-                }
-            }
-            break;
-        case '*':
-            get();
-            while (codeunit != ' ') {
-                switch (get()) {
-                case '*':
-                    if (peek() == '/') {
-                        get();
-                        codeunit = ' ';
-                    }
-                    break;
-                case EOF:
-                    error("Unterminated comment.");
-                }
-            }
-            break;
-        }
-    }
-    the_y = the_x;
-    the_x = codeunit;
-    return codeunit;
-}
-
-
-/* action -- do something! What you do is determined by the argument:
-        1   Output A. Copy B to A. Get the next B.
-        2   Copy B to A. Get the next B. (Delete A).
-        3   Get the next B. (Delete B).
-   action treats a string as a single character.
-   action recognizes a regular expression if it is preceded by the likes of
-   '(' or ',' or '='.
-*/
-
-static void action(int determined) {
-    switch (determined) {
-    case 1:
-        putc(the_a, stdout);
-        if (
-            (the_y == '\n' || the_y == ' ')
-            && (the_a == '+' || the_a == '-' || the_a == '*' || the_a == '/')
-            && (the_b == '+' || the_b == '-' || the_b == '*' || the_b == '/')
-        ) {
-            putc(the_y, stdout);
-        }
-    case 2:
-        the_a = the_b;
-        if (the_a == '\'' || the_a == '"' || the_a == '`') {
-            for (;;) {
-                putc(the_a, stdout);
-                the_a = get();
-                if (the_a == the_b) {
-                    break;
-                }
-                if (the_a == '\\') {
-                    putc(the_a, stdout);
-                    the_a = get();
-                }
-                if (the_a == EOF) {
-                    error("Unterminated string literal.");
-                }
-            }
-        }
-    case 3:
-        the_b = next();
-        if (the_b == '/' && (
-            the_a == '(' || the_a == ',' || the_a == '=' || the_a == ':'
-            || the_a == '[' || the_a == '!' || the_a == '&' || the_a == '|'
-            || the_a == '?' || the_a == '+' || the_a == '-' || the_a == '~'
-            || the_a == '*' || the_a == '/' || the_a == '{' || the_a == '}'
-            || the_a == ';'
-        )) {
-            putc(the_a, stdout);
-            if (the_a == '/' || the_a == '*') {
-                putc(' ', stdout);
-            }
-            putc(the_b, stdout);
-            for (;;) {
-                the_a = get();
-                if (the_a == '[') {
-                    for (;;) {
-                        putc(the_a, stdout);
-                        the_a = get();
-                        if (the_a == ']') {
-                            break;
-                        }
-                        if (the_a == '\\') {
-                            putc(the_a, stdout);
-                            the_a = get();
-                        }
-                        if (the_a == EOF) {
-                            error(
-                                "Unterminated set in Regular Expression literal."
-                            );
-                        }
-                    }
-                } else if (the_a == '/') {
-                    switch (peek()) {
-                    case '/':
-                    case '*':
-                        error(
-                            "Unterminated set in Regular Expression literal."
-                        );
-                    }
-                    break;
-                } else if (the_a =='\\') {
-                    putc(the_a, stdout);
-                    the_a = get();
-                }
-                if (the_a == EOF) {
-                    error("Unterminated Regular Expression literal.");
-                }
-                putc(the_a, stdout);
-            }
-            the_b = next();
-        }
-    }
-}
-
-
-/* jsmin -- Copy the input to the output, deleting the characters which are
-        insignificant to JavaScript. Comments will be removed. Tabs will be
-        replaced with spaces. Carriage returns will be replaced with linefeeds.
-        Most spaces and linefeeds will be removed.
-*/
-
-static void jsmin() {
-    if (peek() == 0xEF) {
-        get();
-        get();
-        get();
-    }
-    the_a = '\n';
-    action(3);
-    while (the_a != EOF) {
-        switch (the_a) {
-        case ' ':
-            action(
-                is_alphanum(the_b)
-                ? 1
-                : 2
-            );
-            break;
-        case '\n':
-            switch (the_b) {
-            case '{':
-            case '[':
-            case '(':
-            case '+':
-            case '-':
-            case '!':
-            case '~':
-                action(1);
-                break;
-            case ' ':
-                action(3);
-                break;
-            default:
-                action(
-                    is_alphanum(the_b)
-                    ? 1
-                    : 2
-                );
-            }
-            break;
-        default:
-            switch (the_b) {
-            case ' ':
-                action(
-                    is_alphanum(the_a)
-                    ? 1
-                    : 3
-                );
-                break;
-            case '\n':
-                switch (the_a) {
-                case '}':
-                case ']':
-                case ')':
-                case '+':
-                case '-':
-                case '"':
-                case '\'':
-                case '`':
-                    action(1);
-                    break;
-                default:
-                    action(
-                        is_alphanum(the_a)
-                        ? 1
-                        : 3
-                    );
-                }
-                break;
-            default:
-                action(1);
-                break;
-            }
-        }
-    }
-}
-
-
-/* main -- Output any command line arguments as comments
-        and then minify the input.
-*/
-
-extern int main(int argc, char* argv[]) {
-    int i;
-    for (i = 1; i < argc; i += 1) {
-        fprintf(stdout, "// %s\n", argv[i]);
-    }
-    jsmin();
-    return 0;
+LUALIB_API int luaopen_jsmin (lua_State *L) {
+  luaL_register(L, "jsmin", thislib);
+  return 1;
 }
